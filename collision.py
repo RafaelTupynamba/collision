@@ -2,12 +2,13 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.patches import Circle
 from matplotlib import animation
-from itertools import combinations
+import queue
+import math
 
 class Particle:
     """A class representing a two-dimensional particle."""
 
-    def __init__(self, x, y, vx, vy, radius=0.01, styles=None):
+    def __init__(self, x, y, vx, vy, g, radius=0.01, styles=None):
         """Initialize the particle's position, velocity, and radius.
 
         Any key-value pairs passed in the styles dictionary will be passed
@@ -17,8 +18,10 @@ class Particle:
 
         self.r = np.array((x, y))
         self.v = np.array((vx, vy))
+        self.g = g
         self.radius = radius
-        self.mass = self.radius**2
+        self.mass = self.radius**3
+        self.epoch = 0
 
         self.styles = styles
         if not self.styles:
@@ -52,6 +55,14 @@ class Particle:
     def vy(self, value):
         self.v[1] = value
 
+    # Instantaneous position (x,y) at time t
+    def pos(self, t):
+    	return self.r + self.v * t + self.g * t * t / 2.0
+
+    # Instantaneous velocity (vx,vy) at time t
+    def vel(self, t):
+    	return self.v + self.g * t
+
     def overlaps(self, other):
         """Does the circle of this Particle overlap that of other?"""
 
@@ -64,10 +75,6 @@ class Particle:
         ax.add_patch(circle)
         return circle
 
-    def advance(self, dt):
-        """Advance the Particle's position forward in time by dt."""
-
-        self.r += self.v * dt
 
 class Simulation:
     """A class for a simple hard-circle molecular dynamics simulation.
@@ -78,7 +85,7 @@ class Simulation:
 
     ParticleClass = Particle
 
-    def __init__(self, n, radius=0.01, styles=None):
+    def __init__(self, n, g=0.0, radius=0.01, styles=None):
         """Initialize the simulation with n Particles with radii radius.
 
         radius can be a single value or a sequence with n values.
@@ -89,8 +96,12 @@ class Simulation:
 
         """
 
-        self.init_particles(n, radius, styles)
         self.dt = 0.01
+        self.t = 0.0
+        self.g = np.array((0.0, -g))
+        self.events = queue.PriorityQueue()
+        self.events.put((self.dt, -1, 0, -1, 0))
+        self.init_particles(n, radius, styles)
 
     def place_particle(self, rad, styles):
         # Choose x, y so that the Particle is entirely inside the
@@ -98,10 +109,8 @@ class Simulation:
         x, y = rad + (1 - 2*rad) * np.random.random(2)
         # Choose a random velocity (within some reasonable range of
         # values) for the Particle.
-        vr = 0.1 * np.sqrt(np.random.random()) + 0.05
-        vphi = 2*np.pi * np.random.random()
-        vx, vy = vr * np.cos(vphi), vr * np.sin(vphi)
-        particle = self.ParticleClass(x, y, vx, vy, rad, styles)
+        vx, vy = 0.1 * np.random.randn(2)
+        particle = self.ParticleClass(x, y, vx, vy, self.g, rad, styles)
         # Check that the Particle doesn't overlap one that's already
         # been placed.
         for p2 in self.particles:
@@ -138,77 +147,152 @@ class Simulation:
             while not self.place_particle(rad, styles):
                 pass
 
-    def change_velocities(self, p1, p2):
-        """
-        Particles p1 and p2 have collided elastically: update their
-        velocities.
+        self.add_all_collisions()
 
-        """
+    # Predict the next collision event between particles i and j
+    def predict_collision(self, i, j):
+        p = self.particles[i]
+        q = self.particles[j]
+        r = q.r - p.r
+        v = q.v - p.v
+        b = 2.0 * np.dot(r, v)
+        if b >= 0.0:
+            return
+        radius = p.radius + q.radius
+        a = np.dot(v, v)
+        if a == 0.0:
+            return
+        c = np.dot(r, r) - radius*radius
+        delta = b*b - 4.0 * a * c
+        if delta < 0.0:
+            return
+        t = (- b - math.sqrt(delta)) / (2.0 * a)
+        if t < self.t:
+       	    return
+       	self.events.put((t, i, p.epoch, j, q.epoch))
         
-        m1, m2 = p1.mass, p2.mass
-        M = m1 + m2
-        r1, r2 = p1.r, p2.r
-        d = np.linalg.norm(r1 - r2)**2
-        v1, v2 = p1.v, p2.v
-        u1 = v1 - 2*m2 / M * np.dot(v1-v2, r1-r2) / d * (r1 - r2)
-        u2 = v2 - 2*m1 / M * np.dot(v2-v1, r2-r1) / d * (r2 - r1)
-        p1.v = u1
-        p2.v = u2
+    # Predict the next collision event between particle i and a wall (horizontal or vertical)
+    def predict_wall_collision(self, i):
+        p = self.particles[i]
+        tx = math.inf
+        if p.vx > 0.0:
+            tx = (1.0 - p.radius - p.x) / p.vx
+        elif p.vx < 0.0:
+            tx = (0.0 + p.radius - p.x) / p.vx
 
-    def handle_collisions(self):
-        """Detect and handle any collisions between the Particles.
+        ty = math.inf
+        if self.g[1] == 0.0:
+            if p.vy > 0.0:
+                ty = (1.0 - p.radius - p.y) / p.vy
+            elif p.vy < 0.0:
+                ty = (0.0 + p.radius - p.y) / p.vy
+        else:
+            a = self.g[1] / 2.0
+            b = p.vy
+            c = p.y - (1.0 - p.radius)
+            delta = b * b - 4.0 * a * c
+            if p.vel(self.t)[1] > 0.0 and delta > 0.0:
+                ty = (- b + math.sqrt(delta)) / (2.0 * a)
+            else:
+                c = p.y - (0.0 + p.radius)
+                delta = b * b - 4.0 * a * c
+                ty = (- b - math.sqrt(delta)) / (2.0 * a)
+        
+        if tx < ty:
+            self.events.put((tx, i, p.epoch, -1, 0))
+        else:
+            self.events.put((ty, i, p.epoch, -2, 0))
 
-        When two Particles collide, they do so elastically: their velocities
-        change such that both energy and momentum are conserved.
+    # Recompute the next collision events for particle i (after the current collision)
+    def update_collisions(self, i):
+        self.particles[i].epoch += 1
+        self.predict_wall_collision(i)
+        for j, q in enumerate(self.particles):
+            if j == i:
+                continue
+            self.predict_collision(i, j)
 
-        """ 
-
-        # We're going to need a sequence of all of the pairs of particles when
-        # we are detecting collisions. combinations generates pairs of indexes
-        # into the self.particles list of Particles on the fly.
-        pairs = combinations(range(self.n), 2)
-        for i,j in pairs:
-            if self.particles[i].overlaps(self.particles[j]):
-                self.change_velocities(self.particles[i], self.particles[j])
-
-    def handle_boundary_collisions(self, p):
-        """Bounce the particles off the walls elastically."""
-
-        if p.x - p.radius < 0:
-            p.x = p.radius
-            p.vx = -p.vx
-        if p.x + p.radius > 1:
-            p.x = 1-p.radius
-            p.vx = -p.vx
-        if p.y - p.radius < 0:
-            p.y = p.radius
-            p.vy = -p.vy
-        if p.y + p.radius > 1:
-            p.y = 1-p.radius
-            p.vy = -p.vy
-
-    def apply_forces(self):
-        """Override this method to accelerate the particles."""
-        pass
+    # Predict the first collision events for all particles at the start of the simulation
+    def add_all_collisions(self):
+        for i, p in enumerate(self.particles):
+            self.predict_wall_collision(i)
+            for j, q in enumerate(self.particles):
+                if j <= i:
+                    continue
+                self.predict_collision(i, j)
 
     def advance_animation(self):
         """Advance the animation by dt, returning the updated Circles list."""
-
+        while True:
+            # Get the next event from the queue
+            self.t, i, ei, j, ej = self.events.get()
+            if i == -1:
+                # Drawing event: periodically draw after time dt
+                self.events.put((self.t + self.dt, -1, 0, -1, 0))
+                break
+            elif j == -1:
+                # x collision against a wall (horizontal flip)
+                p = self.particles[i]
+                if ei == p.epoch:
+                    pos = p.pos(self.t)
+                    x = pos[0]
+                    p.x = 2.0 * x - p.x
+                    p.vx = -p.vx
+                    circle = Circle(xy=(pos[0]+math.copysign(p.radius, -p.vx),pos[1]), radius=0.005, color='gold')
+                    self.ax.add_patch(circle)
+                    if len(self.circles) > len(self.particles) + 5:
+                        c = self.circles.pop(len(self.particles))
+                        c.center = (-1,-1)
+                    self.circles.append(circle)
+                    self.update_collisions(i)
+            elif j == -2:
+                # y collision against ceiling or floor (vertical flip)
+                p = self.particles[i]
+                if ei == p.epoch:
+                    pos = p.pos(self.t)
+                    vel = p.vel(self.t)
+                    vel[1] = -vel[1]
+                    p.v = vel - self.g * self.t
+                    p.r = pos - p.v * self.t - self.g * (self.t * self.t / 2.0)
+                    circle = Circle(xy=(pos[0],pos[1]+math.copysign(p.radius, -vel[1])), radius=0.005, color='gold')
+                    self.ax.add_patch(circle)
+                    if len(self.circles) > len(self.particles) + 5:
+                        c = self.circles.pop(len(self.particles))
+                        c.center = (-1,-1)
+                    self.circles.append(circle)
+                    self.update_collisions(i)
+            else:
+                # Particle-Particle collision
+                p = self.particles[i]
+                q = self.particles[j]
+                if ei == p.epoch and ej == q.epoch:
+                    rp = p.pos(self.t)
+                    rq = q.pos(self.t)
+                    vp = p.vel(self.t)
+                    vq = q.vel(self.t)
+                    r = rq - rp
+                    d = math.sqrt(np.dot(r, r))
+                    r = r/d
+                    u = 2.0 * (np.dot(vp, r) - np.dot(vq, r)) / (1.0/p.mass + 1.0/q.mass)
+                    u = u * r
+                    vp = vp - u/p.mass
+                    vq = vq + u/q.mass
+                    p.v = vp - self.g * self.t
+                    q.v = vq - self.g * self.t
+                    p.r = rp - p.v * self.t - self.g * (self.t * self.t / 2.0)
+                    q.r = rq - q.v * self.t - self.g * (self.t * self.t / 2.0)
+                    
+                    circle = Circle(xy = rp + p.radius * r, radius=0.005, color='gold')
+                    self.ax.add_patch(circle)
+                    if len(self.circles) > len(self.particles) + 5:
+                        c = self.circles.pop(len(self.particles))
+                        c.center = (-1,-1)
+                    self.circles.append(circle)
+                    self.update_collisions(i)
+                    self.update_collisions(j)
         for i, p in enumerate(self.particles):
-            p.advance(self.dt)
-            self.handle_boundary_collisions(p)
-            self.circles[i].center = p.r
-        self.handle_collisions()
-        self.apply_forces()
+            self.circles[i].center = p.pos(self.t)
         return self.circles
-
-    def advance(self):
-        """Advance the animation by dt."""
-        for i, p in enumerate(self.particles):
-            p.advance(self.dt)
-            self.handle_boundary_collisions(p)
-        self.handle_collisions()
-        self.apply_forces()
 
     def init(self):
         """Initialize the Matplotlib animation."""
@@ -255,8 +339,8 @@ class Simulation:
 
 
 if __name__ == '__main__':
-    nparticles = 20
-    radii = np.random.random(nparticles)*0.03+0.02
-    styles = {'edgecolor': 'C0', 'linewidth': 2, 'fill': None}
-    sim = Simulation(nparticles, radii, styles)
+    nparticles = 40
+    radii = np.random.random(nparticles)*0.03+0.01
+    styles = {'edgecolor': 'C0', 'linewidth': 2}
+    sim = Simulation(nparticles, 0.0, radii, styles)
     sim.do_animation(save=False)
